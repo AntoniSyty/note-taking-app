@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: "Note Taking Rest API"
+
+Globals:
+
+  # Configuration defaults for all Lambda functions
+  Function:
+    Runtime: nodejs14.x
+    Handler: index.handler
+    Timeout: 30 
+    Tags:
+      Application: Serverless API
+  
+Resources:
+
+  # Explicit API resource needed to configure an authorizer
+  NoteTakingApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Cors: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # A simple function that just returns URLs to other endpoints
+  IndexFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/index/
+      Events:
+        Home:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /
+            Method: GET
+            # The following lines disable auth for this event
+            Auth:
+              Authorizer: NONE
+
+  # Lambda function that handles signin and signup with the help of Cognito
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/auth/
+      # The configuration needed for Cognito usage via AWS SDK
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+      Events:
+        Signup:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /signup
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        Signin:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /signin
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  # Lambda function that prevents the emission of confirmation emails
+  PreSignupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        exports.handler = async event => {
+          event.response = { autoConfirmUser: true };
+          return event;
+        };
+
+  # The Cognito user pool that stores user accounts
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: ApiUserPool
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignupFunction.Arn
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+
+  # The Cognito user pool client that is used to connect to user pool
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: ApiUserPoolClient
+      GenerateSecret: false
+
+  # Premission for Cognito to execute pre-signup Lambda function
+  LambdaCognitoUserPoolExecutionPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PreSignupFunction.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPool}'
+
+  NoteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/notes/
+      Policies:
+        # Give Create/Read/Update/Delete Permissions to the NotesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotesTable
+      Environment:
+        Variables:
+          # Make table name accessible as environment variable from function code during execution
+          NOTES_TABLE: !Ref NotesTable
+      Events:
+        ListNotes:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /notes
+            Method: GET
+        GetNote:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /notes/{noteId}
+            Method: GET
+        UpdateNote:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /notes/{noteId}
+            Method: PUT        
+        CreateNote:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /notes
+            Method: POST
+        DeleteNote:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NoteTakingApi
+            Path: /notes/{noteId}
+            Method: DELETE
+        
+
+  # DynamoDB table to store notes
+  NotesTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+        - AttributeName: noteId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+        - AttributeName: noteId
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+
+Outputs:
+  ApiUrl:
+    Description: The target URL of the created API
+    Value: !Sub "https://${NoteTakingApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+    Export:
+      Name: ApiUrl
